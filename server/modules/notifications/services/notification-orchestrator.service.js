@@ -16,6 +16,14 @@ const PROVIDER_LABELS = {
   system: 'System'
 };
 
+// Readable text for stop reasons that would otherwise be printed to the user
+// verbatim (see CODE_MAP's 'run.stopped' entry below, which falls back to the
+// raw stopReason when it has no entry here). Add an entry whenever a new
+// machine-readable stopReason value is introduced elsewhere in the codebase.
+const STOP_REASON_MESSAGES = {
+  background_hold_expired: 'Background work was stopped after the chat was idle for too long'
+};
+
 const recentEventKeys = new Map();
 const DEDUPE_WINDOW_MS = 20000;
 
@@ -154,7 +162,7 @@ function buildNotificationPayload(event) {
     'permission.required': normalizedEvent.meta?.toolName
       ? `Action Required: Tool "${normalizedEvent.meta.toolName}" needs approval`
       : 'Action Required: A tool needs your approval',
-    'run.stopped': normalizedEvent.meta?.stopReason || 'Run Stopped: The run has stopped',
+    'run.stopped': STOP_REASON_MESSAGES[normalizedEvent.meta?.stopReason] || normalizedEvent.meta?.stopReason || 'Run Stopped: The run has stopped',
     'run.background_completed': 'Background work finished',
     'run.failed': normalizedEvent.meta?.error ? `Run Failed: ${normalizedEvent.meta.error}` : 'Run Failed: The run encountered an error',
     'agent.notification': normalizedEvent.meta?.message ? String(normalizedEvent.meta.message) : 'You have a new notification',

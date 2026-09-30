@@ -56,6 +56,29 @@ const supersededInstances = new WeakSet();
 
 const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEOUT_MS, 10) || 55000;
 
+// The largest delay Node's setTimeout/setInterval accept: above this the
+// internal 32-bit signed timer field overflows and the timer fires almost
+// immediately instead of after the requested delay (see
+// https://nodejs.org/api/timers.html#settimeoutcallback-delay-args). Both
+// hold ceilings below are passed straight into setTimeout, and
+// BG_WAIT_CEILING_MS is also forwarded to the CLI as
+// CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS, so any configured or test-supplied
+// value is clamped to this before use.
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Reads a positive integer millisecond duration from an env var, falling back
+ * to `fallback` when the var is unset, not a number, or not positive, and
+ * clamping to MAX_TIMER_DELAY_MS otherwise. Used for the two background-hold
+ * ceilings below, which both take an env override. Exported for
+ * server/modules/providers/tests/claude-runtime-hold.test.ts, which verifies
+ * the clamp and the invalid-value fallback directly.
+ */
+export function readPositiveDurationMs(value, fallback) {
+  const parsed = parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, MAX_TIMER_DELAY_MS) : fallback;
+}
+
 // How long background work is allowed to keep running after a turn ends. This drives
 // two halves of the same behaviour:
 //
@@ -68,12 +91,62 @@ const TOOL_APPROVAL_TIMEOUT_MS = parseInt(process.env.CLAUDE_TOOL_APPROVAL_TIMEO
 //     push follow-up turns (background-task completions, Monitor notifications,
 //     scheduled wake-ups).
 //
-// The hold normally ends long before this: a turn with nothing outstanding closes
-// stdin immediately, background work releases it as soon as it reports back, and a
-// new turn supersedes the previous hold. This ceiling only catches background work
-// that never reports at all, so an abandoned session cannot leak a CLI process
-// forever. The timer resets on every message, so it measures silence, not total time.
-const BG_WAIT_CEILING_MS = 30 * 60 * 1000;
+// BG_WAIT_CEILING_MS measures SILENCE, not total time, and resets on every message.
+// On its own that would fire just as readily for background work that is genuinely
+// still running (a long `sleep`) as for work that will never report, so when it
+// fires it is no longer trusted on its own: the background-work tracker
+// (`createBackgroundWorkTracker` below) is asked whether this session still has
+// outstanding tasks. If it does, the hold is re-armed instead of released — the
+// tracker is the ground truth on whether anything is still expected to report
+// back, not the absence of recent messages. Silence still releases immediately
+// when nothing is outstanding (held only for a pending steer, or for work the
+// tracker never saw) — that is what this ceiling is for.
+//
+// BG_HOLD_MAX_MS is the real backstop against a leaked process: an absolute cap on
+// total hold time, measured from when the hold first started, that forces a
+// release even while the tracker still reports work outstanding. A forced release
+// under the cap tells the session so, naming whatever was still outstanding,
+// because that work — and anything it had not yet reported — is gone once stdin
+// closes behind it.
+let BG_WAIT_CEILING_MS = readPositiveDurationMs(process.env.CLOUDCLI_BG_IDLE_CEILING_MS, 30 * 60 * 1000);
+let BG_HOLD_MAX_MS = readPositiveDurationMs(process.env.CLOUDCLI_BG_HOLD_MAX_MS, 12 * 60 * 60 * 1000);
+
+/**
+ * Test-only override for the two hold ceilings above. Both are read once from
+ * their env vars at module load, so a test that needs sub-second ceilings to
+ * observe real timers firing cannot set the env var before import — the test
+ * file already imports this module statically — and calls this instead.
+ * Used by server/modules/providers/tests/claude-runtime-hold.test.ts.
+ * @param {{ idleCeilingMs?: number, holdMaxMs?: number }} overrides
+ */
+export function setBackgroundHoldCeilingsForTests({ idleCeilingMs, holdMaxMs } = {}) {
+  if (typeof idleCeilingMs === 'number') {
+    BG_WAIT_CEILING_MS = Math.min(idleCeilingMs, MAX_TIMER_DELAY_MS);
+  }
+  if (typeof holdMaxMs === 'number') {
+    BG_HOLD_MAX_MS = Math.min(holdMaxMs, MAX_TIMER_DELAY_MS);
+  }
+}
+
+/**
+ * Renders a millisecond duration as a short human phrase (hours, minutes, or
+ * seconds — whichever is coarsest without rounding to zero), for the notice
+ * sent to the session when the absolute hold cap forces a release.
+ */
+function formatHoldDuration(ms) {
+  const hours = ms / (60 * 60 * 1000);
+  if (hours >= 1) {
+    const rounded = Math.round(hours * 10) / 10;
+    return `${rounded} hour${rounded === 1 ? '' : 's'}`;
+  }
+  const minutes = ms / (60 * 1000);
+  if (minutes >= 1) {
+    const rounded = Math.round(minutes * 10) / 10;
+    return `${rounded} minute${rounded === 1 ? '' : 's'}`;
+  }
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  return `${seconds} second${seconds === 1 ? '' : 's'}`;
+}
 
 const TOOLS_REQUIRING_INTERACTION = new Set(['AskUserQuestion', 'ExitPlanMode']);
 
@@ -888,6 +961,12 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   // stream exists; the finally block calls it no matter how the run ends.
   let releasePromptStream = () => {};
   let idleReleaseTimer = null;
+  // Armed once, when the hold first begins (see scheduleAbsoluteCap), and
+  // cleared whenever the hold actually ends — a later hold in the same run
+  // (a new turn starts fresh background work after an earlier one settled)
+  // gets its own fresh BG_HOLD_MAX_MS budget rather than inheriting this one.
+  let capReleaseTimer = null;
+  let holdStartedAt = null;
   // The client is told the turn is over as soon as `result` lands, even though
   // the process lingers, so the UI never waits out the idle hold.
   let turnCompleteSent = false;
@@ -913,7 +992,35 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     getSession(sessionKey())?.releaseInput?.();
   }
 
-  // Arms (or re-arms) the idle countdown that eventually closes stdin.
+  // Clears both hold timers and forgets when the hold started. Called every
+  // time the hold actually ends, so a later hold in this same run starts its
+  // own silence countdown and its own BG_HOLD_MAX_MS budget from scratch.
+  const clearHoldTimers = () => {
+    if (idleReleaseTimer) {
+      clearTimeout(idleReleaseTimer);
+      idleReleaseTimer = null;
+    }
+    if (capReleaseTimer) {
+      clearTimeout(capReleaseTimer);
+      capReleaseTimer = null;
+    }
+    holdStartedAt = null;
+  };
+
+  // Ends the hold: stops both timers and closes stdin. The one path that
+  // actually lets the CLI wind down, used by every branch below that decides
+  // the hold is over (nothing outstanding, a stopped task, or the absolute
+  // cap forcing it).
+  const endHold = () => {
+    clearHoldTimers();
+    heldForBackgroundWork = false;
+    releasePromptStream();
+  };
+
+  // Arms (or re-arms) the idle countdown that eventually closes stdin. Firing
+  // is not itself a release: silence only means nothing has been *reported*,
+  // not that nothing is still running, so the background-work tracker gets
+  // the final word.
   const scheduleRelease = () => {
     if (idleReleaseTimer) {
       clearTimeout(idleReleaseTimer);
@@ -921,10 +1028,52 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
     }
     idleReleaseTimer = setTimeout(() => {
       idleReleaseTimer = null;
-      releasePromptStream();
+      if (backgroundWork.hasOutstanding(sessionKey())) {
+        // Still expected to report back — silence alone doesn't mean
+        // abandoned. Re-arm and let BG_HOLD_MAX_MS be the real backstop.
+        scheduleRelease();
+        return;
+      }
+      endHold();
     }, BG_WAIT_CEILING_MS);
     // Never let the hold keep the server process alive on its own.
     idleReleaseTimer.unref?.();
+  };
+
+  // Arms the absolute cap exactly once per hold (holdStartedAt is cleared by
+  // clearHoldTimers whenever a hold ends), so total hold time is bounded even
+  // for work that reports just often enough to keep re-arming scheduleRelease
+  // forever.
+  const scheduleAbsoluteCap = () => {
+    if (holdStartedAt !== null) {
+      return;
+    }
+    holdStartedAt = Date.now();
+    capReleaseTimer = setTimeout(() => {
+      capReleaseTimer = null;
+      const key = sessionKey();
+      const stillOutstanding = Boolean(key) && backgroundWork.hasOutstanding(key);
+      if (stillOutstanding) {
+        const tasks = backgroundWork.list().find((entry) => entry.sessionId === key)?.tasks || [];
+        const taskNames = tasks.map((task) => task.description || task.taskType || task.taskId).join(', ');
+        ws.send(createNormalizedMessage({
+          kind: 'error',
+          content: `This chat's hold on its background work (${taskNames}) ended after ${formatHoldDuration(BG_HOLD_MAX_MS)}. Background commands still running were stopped; background agents may still finish and report.`,
+          sessionId: capturedSessionId || sessionId || null,
+          provider: 'claude'
+        }));
+        notifyRunStopped({
+          userId: ws?.userId || null,
+          provider: 'claude',
+          sessionId: sessionId || capturedSessionId || null,
+          sessionName: sessionSummary,
+          stopReason: 'background_hold_expired'
+        });
+      }
+      endHold();
+    }, BG_HOLD_MAX_MS);
+    // Never let the cap keep the server process alive on its own.
+    capReleaseTimer.unref?.();
   };
 
   // Hoisted above the try so the catch's cleanup can tell whether this run
@@ -1168,8 +1317,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         && message.status === 'stopped'
         && !backgroundWork.hasOutstanding(sessionKey())
       ) {
-        heldForBackgroundWork = false;
-        releasePromptStream();
+        endHold();
       }
 
       if (message.type === 'result') {
@@ -1219,11 +1367,11 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
         if (holdForTurn) {
           heldForBackgroundWork = true;
           scheduleRelease();
+          scheduleAbsoluteCap();
         } else {
           // Either nothing was backgrounded, or the background work just
           // reported in — let the CLI exit now, as it always has.
-          heldForBackgroundWork = false;
-          releasePromptStream();
+          endHold();
         }
       } else if (idleReleaseTimer) {
         // Background activity after the turn — push the countdown back out.
@@ -1306,10 +1454,7 @@ async function queryClaudeSDK(command, options = {}, ws, context) {
   } finally {
     // Always close stdin — otherwise an aborted or failed run leaves the CLI
     // process (and its MCP servers) alive until the server exits.
-    if (idleReleaseTimer) {
-      clearTimeout(idleReleaseTimer);
-      idleReleaseTimer = null;
-    }
+    clearHoldTimers();
     releasePromptStream();
   }
 }

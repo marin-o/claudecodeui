@@ -9,6 +9,8 @@ import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude
 import {
   listClaudeSDKBackgroundWork,
   queryClaudeSDK,
+  readPositiveDurationMs,
+  setBackgroundHoldCeilingsForTests,
   stopClaudeSDKTask,
 } from '@/modules/providers/list/claude/claude-runtime.provider.js';
 import type { NormalizedMessage, ProviderRuntimeContext } from '@/shared/types.js';
@@ -197,5 +199,86 @@ test('a turn whose tool emits no task events still holds on the static rule', as
     await settle();
 
     assert.equal(script.released(), false, 'Monitor reports no task, so the launch rule decides');
+  });
+});
+
+const DEFAULT_CEILINGS = { idleCeilingMs: 30 * 60 * 1000, holdMaxMs: 12 * 60 * 60 * 1000 };
+
+test('silence alone does not release the process while background work is outstanding', async () => {
+  await withRun(async ({ script }) => {
+    // A tiny idle ceiling so several silences can fire inside the test, and a
+    // hold cap far above them so only the idle path is under test.
+    setBackgroundHoldCeilingsForTests({ idleCeilingMs: 40, holdMaxMs: 60_000 });
+    try {
+      script.emit(init());
+      script.emit(toolUse('toolu_wf', 'Workflow', { script: 'export const meta = {}' }));
+      script.emit(taskStarted('wf1', 'toolu_wf', 'local_workflow'));
+      script.emit(ack('toolu_wf', 'Workflow launched in background. Task ID: wf1', { status: 'async_launched', taskId: 'wf1', taskType: 'local_workflow' }));
+      script.emit(result());
+      await settle();
+      assert.equal(script.released(), false, 'held for the outstanding workflow');
+
+      // Several idle ceilings pass in silence while the task is still
+      // outstanding. Before this fix, the first one released the process.
+      await new Promise((resolve) => setTimeout(resolve, 220));
+      assert.equal(script.released(), false, 'silence alone must not release outstanding work');
+      assert.deepEqual(
+        listClaudeSDKBackgroundWork().map((entry) => entry.tasks.map((task) => task.taskId)),
+        [['wf1']],
+        'the tracker still shows the task outstanding',
+      );
+
+      // The task reports back; the CLI's follow-up turn then ends the hold —
+      // the existing release path, now reached from a re-armed idle timer.
+      script.emit(taskNotification('wf1', 'toolu_wf', 'completed'));
+      await settle();
+      assert.equal(script.released(), false, 'completed keeps the hold for the turn that relays it');
+      script.emit(result());
+      await settle();
+      assert.equal(script.released(), true, 'released once the follow-up turn reports nothing outstanding');
+    } finally {
+      setBackgroundHoldCeilingsForTests(DEFAULT_CEILINGS);
+    }
+  });
+});
+
+test('readPositiveDurationMs clamps an oversized value to Node\'s max timer delay', () => {
+  // 2^31 ms (~24.9 days) overflows Node's 32-bit signed timer field and would
+  // fire almost immediately instead of after ~24.9 days if not clamped.
+  assert.equal(readPositiveDurationMs(String(2_147_483_647 + 1_000_000), 5), 2_147_483_647);
+});
+
+test('readPositiveDurationMs still falls back to the default on an invalid value', () => {
+  // Negative control: an invalid value must keep using `fallback`, not get
+  // clamped or otherwise altered by the new Math.min.
+  assert.equal(readPositiveDurationMs('not-a-number', 5), 5);
+});
+
+test('the absolute hold cap force-releases outstanding work and sends one visible notice', async () => {
+  await withRun(async ({ script, sent }) => {
+    // A hold cap far shorter than the idle ceiling, so the cap — not silence
+    // — is what ends the hold here.
+    setBackgroundHoldCeilingsForTests({ idleCeilingMs: 60_000, holdMaxMs: 80 });
+    try {
+      script.emit(init());
+      script.emit(toolUse('toolu_wf', 'Workflow', { script: 'export const meta = {}' }));
+      script.emit(taskStarted('wf1', 'toolu_wf', 'local_workflow'));
+      script.emit(ack('toolu_wf', 'Workflow launched in background. Task ID: wf1', { status: 'async_launched', taskId: 'wf1', taskType: 'local_workflow' }));
+      script.emit(result());
+      await settle();
+      assert.equal(script.released(), false, 'still within the cap');
+
+      await new Promise((resolve) => setTimeout(resolve, 250));
+
+      assert.equal(script.released(), true, 'the absolute cap forces a release even though the task never settled');
+      const notices = sent.filter((message) => message.kind === 'error');
+      assert.equal(notices.length, 1, 'exactly one visible notice, not one per re-arm');
+      assert.ok(
+        String(notices[0].content).includes('Task wf1'),
+        'the notice names the task the tracker was still holding for',
+      );
+    } finally {
+      setBackgroundHoldCeilingsForTests(DEFAULT_CEILINGS);
+    }
   });
 });
